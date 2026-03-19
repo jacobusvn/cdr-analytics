@@ -1,7 +1,5 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  // Allow embedding in iframe only from GHL and your own domains
+/** @type {import('next').NextConfig} */
+const nextConfig = {
   async headers() {
     const allowedOrigins = process.env.ALLOWED_FRAME_ORIGINS || "'self'";
     return [
@@ -20,4 +18,4 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+module.exports = nextConfig;

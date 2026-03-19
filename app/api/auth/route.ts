@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateTenant } from "@/lib/tenants";
-import { signToken } from "@/lib/jwt";
+import { authenticateTenant } from "../../../lib/tenants";
+import { signToken } from "../../../lib/jwt";
 
 // Simple in-memory rate limiter (per IP, resets on redeploy)
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();

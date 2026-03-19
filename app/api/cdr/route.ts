@@ -17,10 +17,10 @@ interface TokenPayload {
   username: string;
 }
 
-// Cache tenant list to avoid hitting the API on every CDR request
-let tenantCache: Record<string, string> | null = null; // tenantcode -> server ID
+// Cache tenant list
+let tenantCache: Record<string, string> | null = null;
 let tenantCacheTime = 0;
-const TENANT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const TENANT_CACHE_TTL = 10 * 60 * 1000;
 
 async function getTenantServerMap(apiUrl: string, apiKey: string): Promise<Record<string, string>> {
   const now = Date.now();
@@ -52,14 +52,12 @@ function getApiUrl(): string | null {
   if (!apiBase.startsWith("http")) {
     apiBase = `http://${apiBase}`;
   }
-  // Force HTTP — pbx.nexys.co.za has an incomplete SSL certificate chain
   apiBase = apiBase.replace("https://", "http://");
 
   return apiBase;
 }
 
 export async function GET(req: NextRequest) {
-  // Verify auth token
   const authHeader = req.headers.get("authorization");
   if (!authHeader?.startsWith("Bearer ")) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -84,7 +82,6 @@ export async function GET(req: NextRequest) {
   const from = searchParams.get("from") || "";
   const to = searchParams.get("to") || "";
 
-  // Try fetching from Bicom PBXware MT v7 API
   const apiUrl = getApiUrl();
   const apiKey = process.env.API_KEY;
 
@@ -111,16 +108,16 @@ export async function GET(req: NextRequest) {
 }
 
 /**
- * Fetch CDR records from PBXware with pagination.
- * PBXware returns:
- * {
- *   "success": "Success.",
- *   "next_page": true/false,
- *   "limit": 100,
- *   "records": 100,
- *   "header": ["From", "To", "Date/Time", "Total Duration", "Rating Duration", "Rating Cost", "Status", "Unique ID", "Recording Path", "Recording Available", "Location Type", "MOS"],
- *   "csv": [["27107457100", "27876541788", "1773913437", "8", "3", "", "Answered", "1773913437.377244", "", "False", "", 0], ...]
- * }
+ * PBXware CDR format:
+ * header: ["From","To","Date/Time","Total Duration","Rating Duration","Rating Cost","Status","Unique ID","Recording Path","Recording Available","Location Type","MOS"]
+ * csv: [["27107457100","27876541788","1773916846","8","3","","Answered","1773916846.378458","","False","",0], ...]
+ *
+ * Direction detection:
+ * - Location Type "Local" = internal call between extensions
+ * - From CSV: when "From" is a DID/trunk number (27...) and "To" is external = outbound
+ * - When "From" is external and "To" is a DID/extension = inbound
+ * - When "From" contains a name like "Jacobus van Niekerk (7108)" = outbound from extension
+ * - When "To" contains "Ring Group" or extension number = inbound routed to extension
  */
 async function fetchAllCDR(
   apiUrl: string,
@@ -140,7 +137,10 @@ async function fetchAllCDR(
   const allRecords: CDRRecord[] = [];
   let page = 1;
   const pageSize = 200;
-  const maxPages = 10; // Safety limit: max 2000 records
+  const maxPages = 10;
+
+  // Collect all DID numbers seen to help with direction detection
+  const didNumbers = new Set<string>();
 
   while (page <= maxPages) {
     const params = new URLSearchParams({
@@ -157,24 +157,17 @@ async function fetchAllCDR(
 
     const response = await fetch(`${apiUrl}/index.php?${params}`);
     if (!response.ok) {
-      console.error("PBXware CDR API error:", response.status);
       return allRecords.length > 0 ? allRecords : null;
     }
 
     const data = await response.json();
 
-    if (data.error) {
-      console.error("PBXware CDR error:", data.error);
-      return allRecords.length > 0 ? allRecords : null;
-    }
-
-    if (!data.csv || !Array.isArray(data.csv) || data.csv.length === 0) {
+    if (data.error || !data.csv || !Array.isArray(data.csv) || data.csv.length === 0) {
       break;
     }
 
-    // Parse header to get column indices
     const header: string[] = data.header || [];
-    const colIdx = {
+    const col = {
       from: header.indexOf("From"),
       to: header.indexOf("To"),
       dateTime: header.indexOf("Date/Time"),
@@ -183,26 +176,29 @@ async function fetchAllCDR(
       ratingCost: header.indexOf("Rating Cost"),
       status: header.indexOf("Status"),
       uniqueId: header.indexOf("Unique ID"),
+      recordingAvailable: header.indexOf("Recording Available"),
       locationType: header.indexOf("Location Type"),
+      mos: header.indexOf("MOS"),
     };
 
     for (const row of data.csv) {
-      const fromNum = colIdx.from >= 0 ? String(row[colIdx.from] || "") : "";
-      const toNum = colIdx.to >= 0 ? String(row[colIdx.to] || "") : "";
-      const epochStr = colIdx.dateTime >= 0 ? String(row[colIdx.dateTime] || "") : "";
-      const totalDur = colIdx.totalDuration >= 0 ? Number(row[colIdx.totalDuration] || 0) : 0;
-      const ratingCost = colIdx.ratingCost >= 0 ? Number(row[colIdx.ratingCost] || 0) : 0;
-      const rawStatus = colIdx.status >= 0 ? String(row[colIdx.status] || "") : "";
-      const uniqueId = colIdx.uniqueId >= 0 ? String(row[colIdx.uniqueId] || "") : "";
-      const locationType = colIdx.locationType >= 0 ? String(row[colIdx.locationType] || "") : "";
+      const fromRaw = col.from >= 0 ? String(row[col.from] || "") : "";
+      const toRaw = col.to >= 0 ? String(row[col.to] || "") : "";
+      const epochStr = col.dateTime >= 0 ? String(row[col.dateTime] || "") : "";
+      const totalDur = col.totalDuration >= 0 ? Number(row[col.totalDuration] || 0) : 0;
+      const ratingCost = col.ratingCost >= 0 ? parseFloat(String(row[col.ratingCost] || "0")) || 0 : 0;
+      const rawStatus = col.status >= 0 ? String(row[col.status] || "") : "";
+      const uniqueId = col.uniqueId >= 0 ? String(row[col.uniqueId] || "") : "";
+      const locationType = col.locationType >= 0 ? String(row[col.locationType] || "") : "";
+      const hasRecording = col.recordingAvailable >= 0 ? String(row[col.recordingAvailable] || "") === "True" : false;
 
-      // Convert Unix epoch to ISO timestamp
+      // Convert epoch to ISO
       const epoch = parseInt(epochStr, 10);
       const timestamp = !isNaN(epoch)
         ? new Date(epoch * 1000).toISOString()
         : epochStr;
 
-      // Map PBXware status to our status
+      // Map status
       const statusUpper = rawStatus.toUpperCase();
       let status: string;
       if (statusUpper === "ANSWERED") status = "answered";
@@ -212,16 +208,35 @@ async function fetchAllCDR(
       else if (statusUpper === "VOICEMAIL") status = "voicemail";
       else status = "missed";
 
-      // Determine direction:
-      // "Local" location type = internal, otherwise check if from/to matches tenant DID pattern
-      // In PBXware, inbound calls typically have the tenant extension as the "To" field
-      const direction = locationType.toLowerCase() === "local" ? "outbound" : "inbound";
+      // Extract clean numbers (PBXware sometimes includes names like "Jacobus van Niekerk (7108)")
+      const fromNum = extractNumber(fromRaw);
+      const toNum = extractNumber(toRaw);
+
+      // Direction detection:
+      // "Local" = internal extension-to-extension call
+      // If "To" starts with the tenant code prefix (e.g. 999xxxx) = inbound to auto-attendant/ring group
+      // If "From" is an extension (short number or has name) calling external number = outbound
+      // If "From" is external (long number not matching DIDs) calling DID = inbound
+      let direction: string;
+      if (locationType.toLowerCase() === "local") {
+        // Internal call - check if calling out via extension
+        if (fromNum.length <= 5 || /^\d{3,4}$/.test(fromNum)) {
+          // Short extension number dialing out
+          direction = isExternalNumber(toNum) ? "outbound" : "internal";
+        } else {
+          direction = "internal";
+        }
+      } else {
+        // Trunk call - determine by checking if From or To looks like tenant's DID
+        // Collect DIDs as we go (numbers that appear frequently in From for short calls are likely DIDs)
+        direction = detectDirection(fromNum, toNum, fromRaw, toRaw);
+      }
 
       allRecords.push({
         id: uniqueId || `${serverId}-${page}-${allRecords.length}`,
         timestamp,
-        caller: formatPhoneNumber(fromNum),
-        callee: formatPhoneNumber(toNum),
+        caller: formatPhoneNumber(fromNum || fromRaw),
+        callee: formatPhoneNumber(toNum || toRaw),
         duration: totalDur,
         status,
         direction,
@@ -229,22 +244,90 @@ async function fetchAllCDR(
       });
     }
 
-    // Check if there are more pages
-    if (!data.next_page) {
-      break;
-    }
+    if (!data.next_page) break;
     page++;
   }
 
   return allRecords.length > 0 ? allRecords : null;
 }
 
+/**
+ * Extract a phone number from a PBXware field that may contain a name.
+ * Examples:
+ * - "27107457100" -> "27107457100"
+ * - "Jacobus van Niekerk (7108)" -> "7108"
+ * - "Ring Group 1000 Voicemail (1100)" -> "1100"
+ * - "Incoming Calls Ring Group (1000)" -> "1000"
+ */
+function extractNumber(raw: string): string {
+  // If it's already a clean number, return as-is
+  if (/^\d+$/.test(raw.trim())) return raw.trim();
+
+  // Extract number from parentheses: "Name (1234)" -> "1234"
+  const parenMatch = raw.match(/\((\d+)\)/);
+  if (parenMatch) return parenMatch[1];
+
+  // Try to find a long number in the string
+  const numMatch = raw.match(/\b(\d{7,})\b/);
+  if (numMatch) return numMatch[1];
+
+  return raw.trim();
+}
+
+/**
+ * Detect call direction for trunk calls.
+ * Heuristic: in Bicom PBXware, inbound calls come from external numbers
+ * to the tenant's DID. Outbound calls go from the tenant's DID to external.
+ *
+ * Key patterns:
+ * - From: "27107457100" (DID) -> To: "27876541788" = OUTBOUND (DID calling out)
+ * - From: "27876540890" -> To: "27107457100" (DID) = INBOUND (external calling DID)
+ * - From: extension name -> To: external = OUTBOUND
+ * - From: external -> To: ring group/extension = INBOUND
+ */
+function detectDirection(fromNum: string, toNum: string, fromRaw: string, toRaw: string): string {
+  // If "From" contains a name with extension (like "Jacobus van Niekerk (7108)")
+  // it's an outbound call from that extension
+  if (/[a-zA-Z]/.test(fromRaw) && /\(\d+\)/.test(fromRaw)) {
+    return "outbound";
+  }
+
+  // If "To" contains a Ring Group, Voicemail, or extension name = inbound
+  if (/ring\s*group|voicemail|queue/i.test(toRaw)) {
+    return "inbound";
+  }
+  if (/[a-zA-Z]/.test(toRaw) && /\(\d+\)/.test(toRaw)) {
+    return "inbound";
+  }
+
+  // If "To" is a short number (extension, ring group, auto attendant like 9992000)
+  if (/^\d{3,7}$/.test(toNum)) {
+    return "inbound";
+  }
+
+  // Both are long numbers - harder to tell
+  // In SA, DIDs typically match patterns like 2710XXXXXXX (landline) or 27XXXXXXXXX
+  // The "From" field in outbound calls is the tenant's DID (caller ID)
+  // For inbound, "From" is the external caller
+  // Without knowing exact DIDs, we use a heuristic:
+  // If this is a non-Local call and To is a long external number, likely outbound
+  // The "From" being the DID means the PBX is routing out
+
+  // Default: if both numbers are long external numbers, assume outbound
+  // (PBXware shows the DID as "From" when the PBX initiates the call)
+  return "outbound";
+}
+
+function isExternalNumber(num: string): boolean {
+  // External numbers are long (11+ digits for SA)
+  return /^\d{10,}$/.test(num);
+}
+
 function formatPhoneNumber(num: string): string {
-  // Format South African numbers: 27xxxxxxxxx -> +27 xx xxx xxxx
-  if (num.startsWith("27") && num.length >= 11) {
+  if (/^\d{11}$/.test(num) && num.startsWith("27")) {
     return `+${num}`;
   }
-  if (num.length >= 7 && !num.startsWith("+")) {
+  if (/^\d{10,}$/.test(num) && !num.startsWith("+")) {
     return `+${num}`;
   }
   return num;

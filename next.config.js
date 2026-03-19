@@ -1,21 +1,4 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {
-  async headers() {
-    const allowedOrigins = process.env.ALLOWED_FRAME_ORIGINS || "'self'";
-    return [
-      {
-        source: "/(.*)",
-        headers: [
-          {
-            key: "Content-Security-Policy",
-            value: `frame-ancestors ${allowedOrigins}`,
-          },
-          { key: "X-Content-Type-Options", value: "nosniff" },
-          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-        ],
-      },
-    ];
-  },
-};
+const nextConfig = {};
 
 module.exports = nextConfig;

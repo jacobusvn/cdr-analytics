@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { verifyToken } from "../../../lib/jwt";
 
 interface CDRRecord {
   id: string;
@@ -12,6 +11,12 @@ interface CDRRecord {
   cost: number;
 }
 
+interface TokenPayload {
+  tenant_id: string;
+  name: string;
+  username: string;
+}
+
 export async function GET(req: NextRequest) {
   // Verify auth token
   const authHeader = req.headers.get("authorization");
@@ -19,8 +24,18 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const payload = verifyToken(authHeader.slice(7));
-  if (!payload) {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+  }
+
+  let payload: TokenPayload;
+  try {
+    const jwt = await import("jsonwebtoken");
+    payload = jwt.default.verify(authHeader.slice(7), secret, {
+      algorithms: ["HS256"],
+    }) as TokenPayload;
+  } catch {
     return NextResponse.json({ error: "Invalid token" }, { status: 401 });
   }
 
@@ -52,7 +67,6 @@ export async function GET(req: NextRequest) {
 
       if (response.ok) {
         const data = await response.json();
-        // Map API response to our CDR format
         const records: CDRRecord[] = (data.xdr_list || []).map(
           (xdr: Record<string, unknown>, i: number) => ({
             id: String(xdr.i_xdr || i),
@@ -72,7 +86,6 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // Return demo data if no API configured or API call failed
   const records = generateDemoData(payload.tenant_id, from, to);
   return NextResponse.json({ records, source: "demo" });
 }
@@ -89,7 +102,6 @@ function generateDemoData(
   const statuses = ["answered", "missed", "voicemail", "busy"];
   const directions = ["inbound", "outbound"];
 
-  // Seed based on tenant ID for consistent demo data per tenant
   let seed = 0;
   for (let i = 0; i < tenantId.length; i++) seed += tenantId.charCodeAt(i);
   const rand = () => {

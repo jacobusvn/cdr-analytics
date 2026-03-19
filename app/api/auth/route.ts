@@ -1,6 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateTenant } from "../../../lib/tenants";
-import { signToken } from "../../../lib/jwt";
 
 // Simple in-memory rate limiter (per IP, resets on redeploy)
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -54,29 +52,51 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const tenant = await authenticateTenant(username, password);
+    // Dynamic imports to avoid Vercel bundling issues
+    const bcrypt = await import("bcryptjs");
+    const jwt = await import("jsonwebtoken");
+
+    // Parse tenants from env
+    let tenants: Record<string, { password_hash: string; tenant_id: string; name: string }>;
+    try {
+      tenants = JSON.parse(process.env.TENANTS || "{}");
+    } catch {
+      return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+    }
+
+    // Authenticate
+    const tenant = tenants[username];
     if (!tenant) {
-      return NextResponse.json(
-        { error: "Invalid credentials" },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
+    }
+
+    const valid = await bcrypt.compare(password, tenant.password_hash);
+    if (!valid) {
+      return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
     }
 
     // Reset rate limit on successful login
     loginAttempts.delete(ip);
 
-    const token = signToken({
-      tenant_id: tenant.tenant_id,
-      name: tenant.name,
-      username,
-    });
+    // Sign JWT
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      return NextResponse.json({ error: "Server configuration error" }, { status: 500 });
+    }
+
+    const token = jwt.default.sign(
+      { tenant_id: tenant.tenant_id, name: tenant.name, username },
+      secret,
+      { algorithm: "HS256", expiresIn: "8h" }
+    );
 
     return NextResponse.json({
       token,
       tenant_id: tenant.tenant_id,
       name: tenant.name,
     });
-  } catch {
+  } catch (err) {
+    console.error("Auth error:", err);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }

@@ -43,46 +43,72 @@ export async function GET(req: NextRequest) {
   const from = searchParams.get("from") || "";
   const to = searchParams.get("to") || "";
 
-  // Try fetching from external API if configured
-  const apiBase = process.env.API_BASE_URL;
+  // Try fetching from Bicom PBXware MT v7 API
+  const apiBase = process.env.API_BASE_URL; // e.g. https://pbx.nexys.co.za
   const apiKey = process.env.API_KEY;
 
   if (apiBase && apiKey) {
     try {
+      // Format dates as MMM-DD-YYYY for PBXware API
+      const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+      const now = new Date();
+      const startDate = from ? new Date(from) : new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const endDate = to ? new Date(to) : now;
+
+      const fmtDate = (d: Date) =>
+        `${months[d.getMonth()]}-${String(d.getDate()).padStart(2, "0")}-${d.getFullYear()}`;
+
       const params = new URLSearchParams({
-        i_customer: payload.tenant_id,
-        ...(from && { from_date: from }),
-        ...(to && { to_date: to }),
+        apikey: apiKey,
+        action: "pbxware.cdr.download",
+        server: payload.tenant_id,
+        start: fmtDate(startDate),
+        end: fmtDate(endDate),
+        starttime: "00:00:00",
+        endtime: "23:59:59",
+        limit: "500",
       });
 
-      const response = await fetch(
-        `${apiBase}/CDR/get_xdr_list?${params}`,
-        {
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
+      const response = await fetch(`${apiBase}/index.php?${params}`);
 
       if (response.ok) {
         const data = await response.json();
-        const records: CDRRecord[] = (data.xdr_list || []).map(
-          (xdr: Record<string, unknown>, i: number) => ({
-            id: String(xdr.i_xdr || i),
-            timestamp: String(xdr.connect_time || xdr.bill_time || ""),
-            caller: String(xdr.CLI || xdr.CLD || ""),
-            callee: String(xdr.CLD || ""),
-            duration: Number(xdr.charged_quantity || xdr.duration || 0),
-            status: xdr.disconnect_cause === "0" ? "answered" : "missed",
-            direction: xdr.call_class === "1" ? "inbound" : "outbound",
-            cost: Number(xdr.charged_amount || 0),
-          })
+        // PBXware returns an array of CDR records or an object with error
+        const cdrList = Array.isArray(data) ? data : (data.cdr || data.records || []);
+        const records: CDRRecord[] = cdrList.map(
+          (cdr: Record<string, unknown>, i: number) => {
+            const disposition = String(cdr.disposition || "").toUpperCase();
+            let status: string;
+            if (disposition === "ANSWERED") status = "answered";
+            else if (disposition === "BUSY") status = "busy";
+            else if (disposition === "NO ANSWER") status = "missed";
+            else if (disposition === "FAILED") status = "failed";
+            else status = "missed";
+
+            // Determine direction from context or channel info
+            const dcontext = String(cdr.dcontext || "");
+            const direction = dcontext.includes("from-trunk") || dcontext.includes("incoming")
+              ? "inbound" : "outbound";
+
+            return {
+              id: String(cdr.uniqueid || cdr.linkedid || i),
+              timestamp: String(cdr.calldate || ""),
+              caller: String(cdr.src || cdr.clid || ""),
+              callee: String(cdr.dst || ""),
+              duration: Number(cdr.billsec || cdr.duration || 0),
+              status,
+              direction,
+              cost: Number(cdr.cost || cdr.rate || 0),
+            };
+          }
         );
         return NextResponse.json({ records, source: "api" });
+      } else {
+        const errText = await response.text();
+        console.error("PBXware API error:", response.status, errText);
       }
     } catch (err) {
-      console.error("API fetch failed, returning demo data:", err);
+      console.error("PBXware API fetch failed, returning demo data:", err);
     }
   }
 

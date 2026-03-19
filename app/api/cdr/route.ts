@@ -44,8 +44,13 @@ export async function GET(req: NextRequest) {
   const to = searchParams.get("to") || "";
 
   // Try fetching from Bicom PBXware MT v7 API
-  const apiBase = process.env.API_BASE_URL; // e.g. https://pbx.nexys.co.za
+  let apiBase = process.env.API_BASE_URL; // e.g. https://pbx.nexys.co.za
   const apiKey = process.env.API_KEY;
+
+  // Auto-prepend https:// if missing
+  if (apiBase && !apiBase.startsWith("http")) {
+    apiBase = `https://${apiBase}`;
+  }
 
   if (apiBase && apiKey) {
     try {

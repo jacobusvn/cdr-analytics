@@ -3,8 +3,13 @@ import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const apiBase = process.env.API_BASE_URL;
+  let apiBase = process.env.API_BASE_URL;
   const apiKey = process.env.API_KEY;
+
+  // Auto-prepend https:// if missing
+  if (apiBase && !apiBase.startsWith("http")) {
+    apiBase = `https://${apiBase}`;
+  }
 
   if (!apiBase || !apiKey) {
     return NextResponse.json({

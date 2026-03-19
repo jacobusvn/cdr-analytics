@@ -6,7 +6,7 @@ export async function GET() {
   let apiBase = process.env.API_BASE_URL;
   const apiKey = process.env.API_KEY;
 
-  // Force HTTP (PBXware has incomplete SSL chain)
+  // Force HTTP
   if (apiBase && !apiBase.startsWith("http")) {
     apiBase = `http://${apiBase}`;
   }
@@ -15,73 +15,75 @@ export async function GET() {
   }
 
   if (!apiBase || !apiKey) {
-    return NextResponse.json({
-      error: "Missing env vars",
-      API_BASE_URL_SET: !!apiBase,
-      API_KEY_SET: !!apiKey,
-    });
+    return NextResponse.json({ error: "Missing env vars" });
   }
 
-  const results: Record<string, unknown> = {
-    apiBase,
-    apiKeyLength: apiKey.length,
-  };
+  const results: Record<string, unknown> = {};
 
-  // Step 1: Get tenant list to find server ID for tenantcode 999
+  // Get server ID for tenant 999
   let serverId: string | null = null;
   try {
-    const tenantUrl = `${apiBase}/index.php?apikey=${apiKey}&action=pbxware.tenant.list`;
-    const res1 = await fetch(tenantUrl);
-    results.tenantListStatus = res1.status;
-    const tenantData = await res1.json();
-
-    // Find server ID for tenantcode 999 (UnitedTech)
-    for (const [sid, tenant] of Object.entries(tenantData)) {
-      const t = tenant as Record<string, unknown>;
-      if (t.tenantcode === "999") {
+    const res = await fetch(`${apiBase}/index.php?apikey=${apiKey}&action=pbxware.tenant.list`);
+    const tenants = await res.json();
+    for (const [sid, t] of Object.entries(tenants)) {
+      if ((t as Record<string, unknown>).tenantcode === "999") {
         serverId = sid;
-        results.mappedServerId = sid;
-        results.mappedTenantName = t.name;
         break;
       }
     }
-    results.totalTenants = Object.keys(tenantData).length;
+    results.serverId = serverId;
   } catch (err) {
-    results.tenantListError = String(err);
+    results.tenantError = String(err);
   }
 
   if (!serverId) {
-    results.error = "Could not find server ID for tenantcode 999";
+    results.error = "No server ID for tenant 999";
     return NextResponse.json(results);
   }
 
-  // Step 2: Fetch CDR for server ID (using short date range)
+  // Fetch CDR - page 1, limit 10
   try {
-    const cdrUrl = `${apiBase}/index.php?apikey=${apiKey}&action=pbxware.cdr.download&server=${serverId}&start=Mar-17-2026&end=Mar-19-2026&starttime=00:00:00&endtime=23:59:59&limit=5`;
-    results.cdrUrl = cdrUrl.replace(apiKey, "***");
-    const res2 = await fetch(cdrUrl);
-    results.cdrStatus = res2.status;
-    results.cdrHeaders = Object.fromEntries(res2.headers.entries());
-    const text2 = await res2.text();
-    results.cdrRawLength = text2.length;
-    results.cdrRaw = text2.substring(0, 3000);
-    try {
-      const parsed = JSON.parse(text2);
-      results.cdrType = typeof parsed;
-      results.cdrIsArray = Array.isArray(parsed);
-      if (typeof parsed === "object" && parsed !== null) {
-        results.cdrKeys = Object.keys(parsed).slice(0, 10);
-        results.cdrKeyCount = Object.keys(parsed).length;
-        // Show first record
-        const firstKey = Object.keys(parsed)[0];
-        if (firstKey) {
-          results.cdrFirstRecord = parsed[firstKey];
-          results.cdrFirstKey = firstKey;
-        }
-      }
-    } catch {
-      results.cdrParseError = "Not valid JSON";
+    const cdrUrl = `${apiBase}/index.php?apikey=${apiKey}&action=pbxware.cdr.download&server=${serverId}&start=Mar-01-2026&end=Mar-19-2026&starttime=00:00:00&endtime=23:59:59&limit=10&page=1`;
+    const res = await fetch(cdrUrl);
+    const data = await res.json();
+
+    results.success = data.success;
+    results.nextPage = data.next_page;
+    results.totalRecords = data.records;
+    results.limit = data.limit;
+    results.header = data.header;
+
+    // Show first 5 records with header mapping
+    if (data.csv && data.header) {
+      const mapped = data.csv.slice(0, 5).map((row: unknown[]) => {
+        const record: Record<string, unknown> = {};
+        (data.header as string[]).forEach((h: string, i: number) => {
+          record[h] = row[i];
+        });
+        return record;
+      });
+      results.sampleRecords = mapped;
     }
+
+    // Also show raw csv rows
+    results.rawCsvFirst3 = data.csv?.slice(0, 3);
+
+    // Count total pages
+    let totalRecords = 0;
+    let page = 1;
+    let hasMore = true;
+    while (hasMore && page <= 20) {
+      const pageUrl = `${apiBase}/index.php?apikey=${apiKey}&action=pbxware.cdr.download&server=${serverId}&start=Mar-01-2026&end=Mar-19-2026&starttime=00:00:00&endtime=23:59:59&limit=200&page=${page}`;
+      const pageRes = await fetch(pageUrl);
+      const pageData = await pageRes.json();
+      const count = pageData.csv?.length || 0;
+      totalRecords += count;
+      hasMore = pageData.next_page === true;
+      page++;
+    }
+    results.totalRecordsAllPages = totalRecords;
+    results.totalPages = page - 1;
+
   } catch (err) {
     results.cdrError = String(err);
   }

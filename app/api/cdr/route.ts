@@ -32,7 +32,6 @@ async function getTenantServerMap(apiUrl: string, apiKey: string): Promise<Recor
   if (!res.ok) throw new Error(`Tenant list failed: ${res.status}`);
 
   const data = await res.json();
-  // PBXware returns { "10": { tenantcode: "999", name: "UnitedTech", ... }, "13": { ... } }
   const map: Record<string, string> = {};
   for (const [serverId, tenant] of Object.entries(data)) {
     const t = tenant as Record<string, unknown>;
@@ -50,12 +49,10 @@ function getApiUrl(): string | null {
   let apiBase = process.env.API_BASE_URL;
   if (!apiBase) return null;
 
-  // Auto-prepend http:// if no protocol specified
-  // NOTE: Using HTTP because pbx.nexys.co.za has an incomplete SSL certificate chain
   if (!apiBase.startsWith("http")) {
     apiBase = `http://${apiBase}`;
   }
-  // Force HTTP for PBXware (self-signed/incomplete SSL cert)
+  // Force HTTP — pbx.nexys.co.za has an incomplete SSL certificate chain
   apiBase = apiBase.replace("https://", "http://");
 
   return apiBase;
@@ -93,96 +90,15 @@ export async function GET(req: NextRequest) {
 
   if (apiUrl && apiKey) {
     try {
-      // Look up the PBXware server ID from tenantcode
       const tenantMap = await getTenantServerMap(apiUrl, apiKey);
       const serverId = tenantMap[payload.tenant_id];
 
       if (!serverId) {
         console.error(`No PBXware server found for tenantcode: ${payload.tenant_id}`);
-        // Fall through to demo data
       } else {
-        // Format dates as MMM-DD-YYYY for PBXware API
-        const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-        const now = new Date();
-        const startDate = from ? new Date(from) : new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        const endDate = to ? new Date(to) : now;
-
-        const fmtDate = (d: Date) =>
-          `${months[d.getMonth()]}-${String(d.getDate()).padStart(2, "0")}-${d.getFullYear()}`;
-
-        const params = new URLSearchParams({
-          apikey: apiKey,
-          action: "pbxware.cdr.download",
-          server: serverId,
-          start: fmtDate(startDate),
-          end: fmtDate(endDate),
-          starttime: "00:00:00",
-          endtime: "23:59:59",
-          limit: "500",
-        });
-
-        const response = await fetch(`${apiUrl}/index.php?${params}`);
-
-        if (response.ok) {
-          const data = await response.json();
-
-          // Check for API error response
-          if (data.error) {
-            console.error("PBXware API returned error:", data.error);
-          } else {
-            // PBXware returns CDR records - could be array or keyed object
-            let cdrList: Record<string, unknown>[];
-            if (Array.isArray(data)) {
-              cdrList = data;
-            } else if (typeof data === "object" && data !== null) {
-              // PBXware may return records as a keyed object like { "0": {...}, "1": {...} }
-              const values = Object.values(data);
-              if (values.length > 0 && typeof values[0] === "object") {
-                cdrList = values as Record<string, unknown>[];
-              } else {
-                cdrList = [];
-              }
-            } else {
-              cdrList = [];
-            }
-
-            const records: CDRRecord[] = cdrList.map(
-              (cdr: Record<string, unknown>, i: number) => {
-                const disposition = String(cdr.disposition || "").toUpperCase();
-                let status: string;
-                if (disposition === "ANSWERED") status = "answered";
-                else if (disposition === "BUSY") status = "busy";
-                else if (disposition === "NO ANSWER") status = "missed";
-                else if (disposition === "FAILED") status = "failed";
-                else status = "missed";
-
-                // Determine direction from context or channel info
-                const dcontext = String(cdr.dcontext || "");
-                const lastapp = String(cdr.lastapp || "").toLowerCase();
-                const direction =
-                  dcontext.includes("from-trunk") ||
-                  dcontext.includes("incoming") ||
-                  dcontext.includes("from-pstn")
-                    ? "inbound" : "outbound";
-
-                return {
-                  id: String(cdr.uniqueid || cdr.linkedid || i),
-                  timestamp: String(cdr.calldate || ""),
-                  caller: String(cdr.src || cdr.clid || ""),
-                  callee: String(cdr.dst || ""),
-                  duration: Number(cdr.billsec || cdr.duration || 0),
-                  status,
-                  direction,
-                  cost: Number(cdr.cost || cdr.rate || 0),
-                };
-              }
-            );
-
-            return NextResponse.json({ records, source: "api" });
-          }
-        } else {
-          const errText = await response.text();
-          console.error("PBXware API error:", response.status, errText);
+        const records = await fetchAllCDR(apiUrl, apiKey, serverId, from, to);
+        if (records !== null) {
+          return NextResponse.json({ records, source: "api" });
         }
       }
     } catch (err) {
@@ -192,6 +108,146 @@ export async function GET(req: NextRequest) {
 
   const records = generateDemoData(payload.tenant_id, from, to);
   return NextResponse.json({ records, source: "demo" });
+}
+
+/**
+ * Fetch CDR records from PBXware with pagination.
+ * PBXware returns:
+ * {
+ *   "success": "Success.",
+ *   "next_page": true/false,
+ *   "limit": 100,
+ *   "records": 100,
+ *   "header": ["From", "To", "Date/Time", "Total Duration", "Rating Duration", "Rating Cost", "Status", "Unique ID", "Recording Path", "Recording Available", "Location Type", "MOS"],
+ *   "csv": [["27107457100", "27876541788", "1773913437", "8", "3", "", "Answered", "1773913437.377244", "", "False", "", 0], ...]
+ * }
+ */
+async function fetchAllCDR(
+  apiUrl: string,
+  apiKey: string,
+  serverId: string,
+  from: string,
+  to: string
+): Promise<CDRRecord[] | null> {
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const now = new Date();
+  const startDate = from ? new Date(from) : new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const endDate = to ? new Date(to) : now;
+
+  const fmtDate = (d: Date) =>
+    `${months[d.getMonth()]}-${String(d.getDate()).padStart(2, "0")}-${d.getFullYear()}`;
+
+  const allRecords: CDRRecord[] = [];
+  let page = 1;
+  const pageSize = 200;
+  const maxPages = 10; // Safety limit: max 2000 records
+
+  while (page <= maxPages) {
+    const params = new URLSearchParams({
+      apikey: apiKey,
+      action: "pbxware.cdr.download",
+      server: serverId,
+      start: fmtDate(startDate),
+      end: fmtDate(endDate),
+      starttime: "00:00:00",
+      endtime: "23:59:59",
+      limit: String(pageSize),
+      page: String(page),
+    });
+
+    const response = await fetch(`${apiUrl}/index.php?${params}`);
+    if (!response.ok) {
+      console.error("PBXware CDR API error:", response.status);
+      return allRecords.length > 0 ? allRecords : null;
+    }
+
+    const data = await response.json();
+
+    if (data.error) {
+      console.error("PBXware CDR error:", data.error);
+      return allRecords.length > 0 ? allRecords : null;
+    }
+
+    if (!data.csv || !Array.isArray(data.csv) || data.csv.length === 0) {
+      break;
+    }
+
+    // Parse header to get column indices
+    const header: string[] = data.header || [];
+    const colIdx = {
+      from: header.indexOf("From"),
+      to: header.indexOf("To"),
+      dateTime: header.indexOf("Date/Time"),
+      totalDuration: header.indexOf("Total Duration"),
+      ratingDuration: header.indexOf("Rating Duration"),
+      ratingCost: header.indexOf("Rating Cost"),
+      status: header.indexOf("Status"),
+      uniqueId: header.indexOf("Unique ID"),
+      locationType: header.indexOf("Location Type"),
+    };
+
+    for (const row of data.csv) {
+      const fromNum = colIdx.from >= 0 ? String(row[colIdx.from] || "") : "";
+      const toNum = colIdx.to >= 0 ? String(row[colIdx.to] || "") : "";
+      const epochStr = colIdx.dateTime >= 0 ? String(row[colIdx.dateTime] || "") : "";
+      const totalDur = colIdx.totalDuration >= 0 ? Number(row[colIdx.totalDuration] || 0) : 0;
+      const ratingCost = colIdx.ratingCost >= 0 ? Number(row[colIdx.ratingCost] || 0) : 0;
+      const rawStatus = colIdx.status >= 0 ? String(row[colIdx.status] || "") : "";
+      const uniqueId = colIdx.uniqueId >= 0 ? String(row[colIdx.uniqueId] || "") : "";
+      const locationType = colIdx.locationType >= 0 ? String(row[colIdx.locationType] || "") : "";
+
+      // Convert Unix epoch to ISO timestamp
+      const epoch = parseInt(epochStr, 10);
+      const timestamp = !isNaN(epoch)
+        ? new Date(epoch * 1000).toISOString()
+        : epochStr;
+
+      // Map PBXware status to our status
+      const statusUpper = rawStatus.toUpperCase();
+      let status: string;
+      if (statusUpper === "ANSWERED") status = "answered";
+      else if (statusUpper === "BUSY") status = "busy";
+      else if (statusUpper === "NO ANSWER" || statusUpper === "NOANSWER") status = "missed";
+      else if (statusUpper === "FAILED" || statusUpper === "CANCEL") status = "failed";
+      else if (statusUpper === "VOICEMAIL") status = "voicemail";
+      else status = "missed";
+
+      // Determine direction:
+      // "Local" location type = internal, otherwise check if from/to matches tenant DID pattern
+      // In PBXware, inbound calls typically have the tenant extension as the "To" field
+      const direction = locationType.toLowerCase() === "local" ? "outbound" : "inbound";
+
+      allRecords.push({
+        id: uniqueId || `${serverId}-${page}-${allRecords.length}`,
+        timestamp,
+        caller: formatPhoneNumber(fromNum),
+        callee: formatPhoneNumber(toNum),
+        duration: totalDur,
+        status,
+        direction,
+        cost: ratingCost,
+      });
+    }
+
+    // Check if there are more pages
+    if (!data.next_page) {
+      break;
+    }
+    page++;
+  }
+
+  return allRecords.length > 0 ? allRecords : null;
+}
+
+function formatPhoneNumber(num: string): string {
+  // Format South African numbers: 27xxxxxxxxx -> +27 xx xxx xxxx
+  if (num.startsWith("27") && num.length >= 11) {
+    return `+${num}`;
+  }
+  if (num.length >= 7 && !num.startsWith("+")) {
+    return `+${num}`;
+  }
+  return num;
 }
 
 function generateDemoData(

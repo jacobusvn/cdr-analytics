@@ -1,9 +1,5 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  experimental: {
-    // Prevent webpack from bundling these - load from node_modules at runtime
-    serverComponentsExternalPackages: ["bcryptjs", "jsonwebtoken"],
-  },
   async headers() {
     const allowedOrigins = process.env.ALLOWED_FRAME_ORIGINS || "'self'";
     return [

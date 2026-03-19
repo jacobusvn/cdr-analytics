@@ -1,6 +1,10 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function GET() {
+// Force dynamic - do not prerender
+export const dynamic = "force-dynamic";
+
+export async function GET(req: NextRequest) {
+  void req;
   const diagnostics: Record<string, unknown> = {
     status: "ok",
     timestamp: new Date().toISOString(),
